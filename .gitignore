@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+secrets.*
+
+# Logs
+*.log
+logs/
+
+# Experiment outputs and generated artifacts
+prompts/
+local_testplans/
+data/processed/
+outputs/
+runs/
+models/
+artifacts/
+checkpoints/
+mlruns/
+wandb/
+tensorboard/
+
+# Generated reports and large binary outputs
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+# SQLite runtime sidecars and backups
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite.bak
+*.sqlite.backup
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Keep the curated source database in version control.
+!ttf_klines_5m_from_1m.sqlite

@@ -1,0 +1,12 @@
+# Baseline Monte-Carlo path generation config for the FRONT TTF series.
+database_path: ttf_klines_5m_from_1m.sqlite
+symbol: FRONT
+interval: 5m
+model_type: gjr_garch
+horizon_steps: 288
+n_paths: 100
+seed: 1234
+start_price:
+time_step: 5min
+steps_per_day: 288
+output_path: outputs/mc_paths_front_gjr_garch.csv
