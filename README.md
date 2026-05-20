@@ -129,7 +129,7 @@ are improved.
 
 Auxiliary rolling-refit GJR-GARCH stress-period visual check:
 
-![Daily return bands](outputs/garch_refit_report_front/garch_daily_return_bands.png)
+![Daily return bands](docs/assets/readme/garch_daily_return_bands.png)
 
 ## LSMC Valuation For American And Swing Options
 
@@ -183,7 +183,7 @@ validation paths per window, `288` steps, ATM strike per window, bootstrap seed
 | p4_20260326 | linear Fitted-Q | `24.307201` | `24.720466` | `-0.413265` | policy failure | never-exercise fallback | `24.720466` |
 | p4_20260326 | kernel Fitted-Q | `20.331176` | `24.720466` | `-4.389290` | policy failure | never-exercise fallback | `24.720466` |
 
-![LSMC valuation bars](outputs/option_lsmc_report_front/valuation_bars.png)
+![LSMC valuation bars](docs/assets/readme/option_lsmc_valuation_bars.png)
 
 Practical assessment: with 2048 paths across 4 GJR-GARCH windows, raw American
 call replay violates the European lower bound in `10` of `12` learned-policy
@@ -258,7 +258,7 @@ Validation gate diagnostics make the American-call rejections explicit:
 | American call linear Fitted-Q | `-4.193812` | `[-5.430396, -3.234534]` | `-55.978968` | fail | fail |
 | American call kernel Fitted-Q | `-5.170529` | `[-6.440000, -4.188624]` | `-62.645284` | fail | fail |
 
-![Policy paired deltas](outputs/policy_evaluation_front/paired_delta_distribution.png)
+![Policy paired deltas](docs/assets/readme/policy_paired_delta_distribution.png)
 
 Open work for a stronger LSMC-vs-RL comparison: improve the American-call
 exercise policies before reporting them as values, run larger sensitivity
@@ -384,11 +384,11 @@ Fitted-Q loses `-3.569809`, and Raw Kernel Fitted-Q loses `-16.459564`. On
 up-or-flat close days, the raw methods are less damaging, but this does not
 offset the downside-regime losses.
 
-![Trader-choice cumulative gross PnL](outputs/trader_choice_backtest_front/cumulative_gross_pnl.png)
+![Trader-choice cumulative gross PnL](docs/assets/readme/trader_choice_cumulative_gross_pnl.png)
 
-![Trader-choice cumulative delta versus maturity](outputs/trader_choice_backtest_front/cumulative_delta_vs_maturity.png)
+![Trader-choice cumulative delta versus maturity](docs/assets/readme/trader_choice_cumulative_delta_vs_maturity.png)
 
-![Trader-choice model value versus realized cashflow](outputs/trader_choice_backtest_front/model_price_vs_realized.png)
+![Trader-choice model value versus realized cashflow](docs/assets/readme/trader_choice_model_price_vs_realized.png)
 
 Result: the current learned policies are useful as diagnostics for exercise
 logic and valuation failure modes, not as production valuation rules. The
