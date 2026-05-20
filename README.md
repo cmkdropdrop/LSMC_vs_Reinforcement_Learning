@@ -6,6 +6,37 @@ and later reinforcement-learning methods. The current codebase is not yet a
 complete option or RL engine. It provides the data, volatility-modeling, path
 simulation, and first valuation building blocks needed for a fair comparison.
 
+## TL;DR
+
+The most useful result so far is the Historical Trader Choice Backtest. It is
+not a risk-neutral fair-value test and should not be read as a market-consistent
+option price. It asks a different question from a risk taker's perspective: if a
+trader owned a daily ATM American put exercise right on realized `FRONT` prices
+and had to choose between maturity exercise, LSMC, or RL/ADP exercise policies,
+which rule would have produced better realized cashflows?
+
+On the current `2026-03-02` to `2026-03-19` sample, the answer is conservative:
+simple maturity exercise is the best non-oracle deployable rule with
+cost-adjusted PnL `26.294498`. No raw learned policy has positive total edge
+against maturity. Raw Linear Fitted-Q is least bad at `-2.319811` versus
+maturity, Raw LSMC loses `-7.064674`, and Raw Kernel Fitted-Q loses
+`-15.494576`.
+
+The validation gate rejected every learned candidate in this sample. That is not
+a failure of the gate; from a risk-taking deployment perspective it is the most
+valuable finding. The gate avoids `24.879061` of realized underperformance
+versus always deploying the raw learned candidates. The model-price diagnostics
+also argue against using the current learned policies as valuation rules: Raw
+Linear Fitted-Q has positive paper model-net PnL, but still overvalues realized
+cashflow on `58.33%` of days, while Raw Kernel Fitted-Q is a clear valuation
+failure with model value `28.228126` versus realized cashflow `10.799922`.
+
+Practical interpretation: this project is currently better at identifying
+unsafe exercise and valuation behavior than at producing a production-ready
+learned valuation strategy. The next useful work is path realism, calibration of
+model value versus realized cashflow, and stricter out-of-sample validation
+before allowing learned policies to override maturity exercise.
+
 ## Working Asset
 
 The current analysis uses TTF gas market data, a key European gas benchmark.
