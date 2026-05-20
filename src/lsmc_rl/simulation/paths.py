@@ -24,6 +24,8 @@ class PathSimulationConfig:
     horizon_steps: int = 288
     n_paths: int = 100
     seed: int | None = 1234
+    start: str | pd.Timestamp | None = None
+    end: str | pd.Timestamp | None = None
     start_price: float | None = None
     time_step: str = "5min"
     steps_per_day: int = 288
@@ -55,6 +57,8 @@ def load_config(config_path: str | Path) -> PathSimulationConfig:
         horizon_steps=int(raw.get("horizon_steps", 288)),
         n_paths=int(raw.get("n_paths", 100)),
         seed=None if raw.get("seed") is None else int(raw.get("seed")),
+        start=raw.get("start"),
+        end=raw.get("end"),
         start_price=None if raw.get("start_price") is None else float(raw.get("start_price")),
         time_step=str(raw.get("time_step", "5min")),
         steps_per_day=int(raw.get("steps_per_day", 288)),
@@ -67,6 +71,8 @@ def run_simulation(config: PathSimulationConfig) -> PathSimulationResult:
         db_path=config.database_path,
         symbol=config.symbol,
         interval=config.interval,
+        start=config.start,
+        end=config.end,
     )
     start_price = float(config.start_price if config.start_price is not None else market["close"].iloc[-1])
     if start_price <= 0:
@@ -162,6 +168,8 @@ def build_summary(
         "n_paths": config.n_paths,
         "horizon_steps": config.horizon_steps,
         "seed": config.seed,
+        "requested_start": None if config.start is None else str(config.start),
+        "requested_end": None if config.end is None else str(config.end),
         "data_quality": report.to_dict(),
         "final_price_min": float(final_prices.min()),
         "final_price_mean": float(final_prices.mean()),
@@ -190,11 +198,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fit volatility model and simulate Monte-Carlo price paths.")
     parser.add_argument("--config", required=True, help="YAML configuration path.")
     parser.add_argument("--model-type", choices=["gjr_garch", "har_rv"], help="Override model_type from config.")
+    parser.add_argument("--start", help="Optional inclusive historical calibration start timestamp.")
+    parser.add_argument("--end", help="Optional inclusive historical calibration end timestamp.")
     parser.add_argument("--output-path", help="Override output_path from config.")
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
-    if args.model_type or args.output_path:
+    if args.model_type or args.start or args.end or args.output_path:
         config = PathSimulationConfig(
             database_path=config.database_path,
             symbol=config.symbol,
@@ -203,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
             horizon_steps=config.horizon_steps,
             n_paths=config.n_paths,
             seed=config.seed,
+            start=args.start if args.start is not None else config.start,
+            end=args.end if args.end is not None else config.end,
             start_price=config.start_price,
             time_step=config.time_step,
             steps_per_day=config.steps_per_day,

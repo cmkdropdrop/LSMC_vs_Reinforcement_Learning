@@ -45,3 +45,24 @@ def test_run_simulation_smoke_with_har_rv_repo_data() -> None:
     assert (result_a.paths["price"] > 0.0).all()
     pd.testing.assert_frame_equal(result_a.paths, result_b.paths)
     assert result_a.summary["model_type"] == "har_rv"
+
+
+def test_run_simulation_respects_historical_start_end() -> None:
+    config = PathSimulationConfig(
+        database_path=DB_PATH,
+        symbol="FRONT",
+        interval="5m",
+        model_type="har_rv",
+        horizon_steps=2,
+        n_paths=2,
+        seed=123,
+        start="2025-04-01T00:00:00Z",
+        end="2025-06-30T23:59:59Z",
+        output_path=None,
+    )
+
+    result = run_simulation(config)
+
+    assert result.summary["requested_start"] == "2025-04-01T00:00:00Z"
+    assert result.summary["requested_end"] == "2025-06-30T23:59:59Z"
+    assert pd.Timestamp(result.summary["historical_end"]) <= pd.Timestamp("2025-06-30T23:59:59Z")

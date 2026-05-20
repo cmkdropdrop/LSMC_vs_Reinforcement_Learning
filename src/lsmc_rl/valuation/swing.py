@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Mapping
 
 import numpy as np
 import pandas as pd
 
 from lsmc_rl.valuation.american import RegressionConfig
 from lsmc_rl.valuation.common import (
+    ContinuationModel,
     PathMatrices,
     clean_variance_feature,
     confidence_interval_95,
@@ -111,7 +112,99 @@ class SwingLSMCResult:
     exercise_profile: pd.DataFrame
     regression_diagnostics: pd.DataFrame
     volume_summary: dict[str, float]
+    policy_model: "SwingLSMCPolicy"
     contract: SwingOptionContract
+
+
+@dataclass(frozen=True)
+class SwingLSMCPolicy:
+    """Frozen swing nomination policy learned by LSMC/ADP."""
+
+    contract: SwingOptionContract
+    regression: RegressionConfig
+    grid: SwingContractGrid
+    continuation_models: Mapping[int, ContinuationModel]
+    fallback_continuation: Mapping[tuple[int, int], float]
+    name: str = "swing_lsmc"
+
+    def nominate(self, state: Any) -> float:
+        remaining_units = _volume_to_units(
+            float(state.remaining_volume),
+            self.contract.volume_step,
+            "remaining_volume",
+        )
+        action_units = self.nominate_units(
+            step=int(state.step),
+            price=float(state.current_price),
+            variance=getattr(state, "variance", None),
+            remaining_units=remaining_units,
+        )
+        return float(action_units * self.contract.volume_step)
+
+    def nominate_units(
+        self,
+        step: int,
+        price: float,
+        variance: float | None,
+        remaining_units: int,
+    ) -> int:
+        actions = _feasible_action_units(
+            remaining_units=remaining_units,
+            step=step,
+            contract=self.contract,
+            grid=self.grid,
+        )
+        if len(actions) == 1:
+            return int(actions[0])
+
+        margin = float(self.contract.margin(np.asarray([price], dtype=float))[0])
+        best_value = -np.inf
+        best_action = int(actions[0])
+        for action_units in actions:
+            after_units = int(remaining_units - action_units)
+            immediate = float(action_units * self.contract.volume_step * margin)
+            if step == self.grid.maturity_step:
+                continuation = -_terminal_shortfall_penalty(after_units, self.contract, self.grid)
+            else:
+                continuation = float(
+                    self.predict_continuation_value(
+                        step=step,
+                        price=price,
+                        variance=variance,
+                        remaining_units=after_units,
+                    )
+                )
+            total = immediate + continuation
+            if total > best_value:
+                best_value = total
+                best_action = int(action_units)
+        return best_action
+
+    def predict_continuation_value(
+        self,
+        step: int,
+        price: float,
+        variance: float | None,
+        remaining_units: int,
+    ) -> float:
+        fallback = float(self.fallback_continuation.get((int(step), int(remaining_units)), 0.0))
+        model = self.continuation_models.get(int(step))
+        if model is None:
+            value = fallback
+        else:
+            variance_array = None if variance is None else np.asarray([variance], dtype=float)
+            features, _ = swing_regression_features(
+                prices=np.asarray([price], dtype=float),
+                variances=variance_array,
+                remaining_units=np.asarray([remaining_units], dtype=float),
+                contract=self.contract,
+                grid=self.grid,
+                regression=self.regression,
+            )
+            value = float(model.predict(features)[0])
+        if self.regression.clip_negative_continuation:
+            value = max(value, 0.0)
+        return value
 
 
 def value_swing_option_lsmc(
@@ -141,23 +234,28 @@ def value_swing_option_lsmc(
     step_discount = float(np.exp(-contract.risk_free_rate * contract.time_step_years))
 
     next_values = np.zeros((n_paths, grid.max_total_units + 1), dtype=float)
-    policy_by_step: dict[int, np.ndarray] = {}
+    continuation_models: dict[int, ContinuationModel] = {}
+    fallback_continuation: dict[tuple[int, int], float] = {}
     diagnostics: list[dict[str, float | int | str]] = []
 
     for step in range(maturity, contract.exercise_start_step - 1, -1):
         margin = contract.margin(prices[:, step])
         current_values = np.empty_like(next_values)
-        current_actions = np.zeros((n_paths, grid.max_total_units + 1), dtype=int)
         model = None
         status = "terminal" if step == maturity else "constant_fallback"
         r2 = float("nan")
         rows = 0
 
         if step < maturity:
+            discounted_next_values = step_discount * next_values
+            for remaining_units in range(grid.max_total_units + 1):
+                fallback_continuation[(step, remaining_units)] = float(
+                    np.mean(discounted_next_values[:, remaining_units])
+                )
             features, feature_names, target = _stack_swing_regression_rows(
                 prices=prices[:, step],
                 variances=clean_variance_feature(variances, step, n_paths),
-                next_values=step_discount * next_values,
+                next_values=discounted_next_values,
                 contract=contract,
                 grid=grid,
                 regression=regression,
@@ -171,6 +269,7 @@ def value_swing_option_lsmc(
                     ridge_alpha=regression.ridge_alpha,
                 )
                 r2 = model.r2
+                continuation_models[step] = model
                 status = "ridge"
 
         for remaining_units in range(grid.max_total_units + 1):
@@ -181,7 +280,6 @@ def value_swing_option_lsmc(
                 grid=grid,
             )
             best_value = np.full(n_paths, -np.inf, dtype=float)
-            best_action = np.zeros(n_paths, dtype=int)
             for action_units in actions:
                 after_units = remaining_units - action_units
                 immediate = action_units * contract.volume_step * margin
@@ -204,11 +302,8 @@ def value_swing_option_lsmc(
                     total = immediate + continuation
                 take = total > best_value
                 best_value[take] = total[take]
-                best_action[take] = action_units
             current_values[:, remaining_units] = best_value
-            current_actions[:, remaining_units] = best_action
 
-        policy_by_step[step] = current_actions
         next_values = current_values
         diagnostics.append(
             {
@@ -221,13 +316,19 @@ def value_swing_option_lsmc(
             }
         )
 
-    start_values_at_exercise_start = next_values[:, grid.max_total_units]
-    path_values = start_values_at_exercise_start * np.power(step_discount, contract.exercise_start_step)
-    policy = _forward_policy(
+    policy_model = SwingLSMCPolicy(
+        contract=contract,
+        regression=regression,
+        grid=grid,
+        continuation_models=continuation_models,
+        fallback_continuation=fallback_continuation,
+    )
+    policy, path_values = _forward_apply_swing_policy_model(
         prices=prices,
+        variances=variances,
         contract=contract,
         grid=grid,
-        policy_by_step=policy_by_step,
+        policy_model=policy_model,
         matrices=matrices,
     )
     profile = _swing_exercise_profile(policy)
@@ -242,6 +343,7 @@ def value_swing_option_lsmc(
         exercise_profile=profile,
         regression_diagnostics=pd.DataFrame(diagnostics).sort_values("step").reset_index(drop=True),
         volume_summary=volume_summary,
+        policy_model=policy_model,
         contract=contract,
     )
 
@@ -377,38 +479,106 @@ def _terminal_shortfall_penalty(
     return float(shortfall_units * contract.volume_step * contract.shortfall_penalty_per_unit)
 
 
-def _forward_policy(
+def _forward_apply_swing_policy_model(
     prices: np.ndarray,
+    variances: np.ndarray | None,
     contract: SwingOptionContract,
     grid: SwingContractGrid,
-    policy_by_step: dict[int, np.ndarray],
+    policy_model: SwingLSMCPolicy,
     matrices: PathMatrices | None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, np.ndarray]:
     n_paths = prices.shape[0]
+    step_discount = float(np.exp(-contract.risk_free_rate * contract.time_step_years))
+    path_ids = np.arange(n_paths, dtype=int) if matrices is None else matrices.path_ids
     remaining = np.full(n_paths, grid.max_total_units, dtype=int)
-    rows: list[pd.DataFrame] = []
-    path_index = np.arange(n_paths)
-    for step in range(contract.exercise_start_step, grid.maturity_step + 1):
-        action_matrix = policy_by_step[step]
-        action_units = action_matrix[path_index, remaining]
-        before = remaining.copy()
-        remaining = remaining - action_units
-        frame = pd.DataFrame(
-            {
-                "path": path_index,
-                "step": step,
-                "price": prices[:, step],
-                "remaining_volume_before": before * contract.volume_step,
-                "action_volume": action_units * contract.volume_step,
-                "remaining_volume_after": remaining * contract.volume_step,
-                "period_margin": contract.margin(prices[:, step]),
-                "immediate_payoff": action_units * contract.volume_step * contract.margin(prices[:, step]),
-            }
+    exercised = np.zeros(n_paths, dtype=int)
+    path_values = np.zeros(n_paths, dtype=float)
+    rows: list[dict[str, Any]] = []
+    exercise_steps = [
+        step
+        for step in range(contract.exercise_start_step, grid.maturity_step + 1)
+        if contract.is_exercise_step(step, grid.maturity_step)
+    ]
+
+    for step in exercise_steps:
+        step_time = _time_at_step(matrices, step)
+        for path_index in range(n_paths):
+            price = float(prices[path_index, step])
+            variance = _variance_at_step(variances, path_index, step)
+            before = int(remaining[path_index])
+            action_units = policy_model.nominate_units(
+                step=step,
+                price=price,
+                variance=variance,
+                remaining_units=before,
+            )
+            action_units = _project_internal_action_units(action_units, before, step, contract, grid)
+            remaining[path_index] -= action_units
+            exercised[path_index] += action_units
+            action_volume = action_units * contract.volume_step
+            immediate = action_volume * float(contract.margin(np.asarray([price], dtype=float))[0])
+            discounted_immediate = immediate * np.power(step_discount, step)
+            path_values[path_index] += discounted_immediate
+            rows.append(
+                {
+                    "path": path_ids[path_index],
+                    "step": step,
+                    "time": step_time,
+                    "price": price,
+                    "remaining_volume_before": before * contract.volume_step,
+                    "action_volume": action_volume,
+                    "remaining_volume_after": remaining[path_index] * contract.volume_step,
+                    "period_margin": float(contract.margin(np.asarray([price], dtype=float))[0]),
+                    "immediate_payoff": immediate,
+                    "discounted_immediate_payoff": discounted_immediate,
+                }
+            )
+
+    if contract.enforce_min_total_volume and contract.shortfall_penalty_per_unit != 0.0:
+        total_volume = exercised * contract.volume_step
+        shortfall = np.maximum(contract.min_total_volume - total_volume, 0.0)
+        path_values -= shortfall * contract.shortfall_penalty_per_unit * np.power(
+            step_discount,
+            grid.maturity_step,
         )
-        if matrices is not None and matrices.times is not None and step in matrices.times.index:
-            frame["time"] = matrices.times.loc[step]
-        rows.append(frame)
-    return pd.concat(rows, ignore_index=True)
+
+    return pd.DataFrame(rows), path_values
+
+
+def _project_internal_action_units(
+    requested_units: int,
+    remaining_units: int,
+    step: int,
+    contract: SwingOptionContract,
+    grid: SwingContractGrid,
+) -> int:
+    feasible = _feasible_action_units(
+        remaining_units=remaining_units,
+        step=step,
+        contract=contract,
+        grid=grid,
+    )
+    if int(requested_units) in set(feasible):
+        return int(requested_units)
+    return int(min(feasible, key=lambda candidate: (abs(int(candidate) - int(requested_units)), int(candidate))))
+
+
+def _time_at_step(matrices: PathMatrices | None, step: int) -> pd.Timestamp | None:
+    if matrices is None or matrices.times is None or step not in matrices.times.index:
+        return None
+    value = matrices.times.loc[step]
+    if pd.isna(value):
+        return None
+    return pd.Timestamp(value)
+
+
+def _variance_at_step(variances: np.ndarray | None, path_index: int, step: int) -> float | None:
+    if variances is None:
+        return None
+    value = float(variances[path_index, step])
+    if not np.isfinite(value) or value < 0.0:
+        return None
+    return value
 
 
 def _swing_exercise_profile(policy: pd.DataFrame) -> pd.DataFrame:

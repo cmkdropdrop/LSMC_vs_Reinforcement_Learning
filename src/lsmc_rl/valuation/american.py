@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, Mapping
 
 import numpy as np
 import pandas as pd
 
 from lsmc_rl.valuation.common import (
+    ContinuationModel,
     PathMatrices,
     clean_variance_feature,
     confidence_interval_95,
@@ -32,6 +33,7 @@ class RegressionConfig:
     include_intrinsic: bool = True
     include_variance: bool = True
     clip_negative_continuation: bool = True
+    exercise_tolerance: float = 1e-12
 
 
 @dataclass(frozen=True)
@@ -92,7 +94,69 @@ class AmericanLSMCResult:
     regression_diagnostics: pd.DataFrame
     european_value: float
     european_stderr: float
+    policy: "AmericanLSMCPolicy"
     contract: AmericanOptionContract
+
+
+@dataclass(frozen=True)
+class AmericanLSMCPolicy:
+    """Frozen American-option exercise policy learned by LSMC."""
+
+    contract: AmericanOptionContract
+    regression: RegressionConfig
+    maturity_step: int
+    continuation_models: Mapping[int, ContinuationModel]
+    fallback_continuation: Mapping[int, float]
+    name: str = "american_lsmc"
+
+    def decide_exercise(self, state: Any) -> bool:
+        """Return True when immediate exercise beats fitted continuation."""
+
+        step = int(state.step)
+        if not self.contract.is_exercise_step(step, self.maturity_step):
+            return False
+        if step >= self.maturity_step:
+            return bool(state.intrinsic_value > self.regression.exercise_tolerance)
+        if self.regression.itm_only and state.intrinsic_value <= self.regression.exercise_tolerance:
+            return False
+        continuation = self.predict_continuation(state)
+        return bool(state.intrinsic_value > continuation + self.regression.exercise_tolerance)
+
+    def predict_continuation(self, state: Any) -> float:
+        """Predict continuation value for a single policy state."""
+
+        variance = None if getattr(state, "variance", None) is None else np.asarray([state.variance], dtype=float)
+        return float(
+            self.predict_continuation_values(
+                step=int(state.step),
+                prices=np.asarray([state.current_price], dtype=float),
+                variances=variance,
+            )[0]
+        )
+
+    def predict_continuation_values(
+        self,
+        step: int,
+        prices: np.ndarray,
+        variances: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Predict continuation values for one exercise step and many states."""
+
+        current_prices = np.asarray(prices, dtype=float).reshape(-1)
+        fallback = float(self.fallback_continuation.get(int(step), 0.0))
+        values = np.full(current_prices.shape[0], fallback, dtype=float)
+        model = self.continuation_models.get(int(step))
+        if model is not None:
+            features, _ = american_regression_features(
+                prices=current_prices,
+                variances=variances,
+                contract=self.contract,
+                regression=self.regression,
+            )
+            values = model.predict(features)
+        if self.regression.clip_negative_continuation:
+            values = np.maximum(values, 0.0)
+        return values
 
 
 def value_european_option(
@@ -133,6 +197,8 @@ def value_american_option_lsmc(
     step_discount = float(np.exp(-contract.risk_free_rate * contract.time_step_years))
     exercise_steps = np.full(n_paths, maturity, dtype=int)
     exercise_payoffs = payoff[:, maturity].copy()
+    continuation_models: dict[int, ContinuationModel] = {}
+    fallback_continuation: dict[int, float] = {}
     diagnostics: list[dict[str, float | int | str]] = []
 
     for step in range(maturity - 1, contract.exercise_start_step - 1, -1):
@@ -141,17 +207,28 @@ def value_american_option_lsmc(
             continue
 
         immediate = payoff[:, step]
-        candidates = immediate > 0.0 if regression.itm_only else np.ones(n_paths, dtype=bool)
+        candidates = (
+            immediate > regression.exercise_tolerance
+            if regression.itm_only
+            else np.ones(n_paths, dtype=bool)
+        )
         discounted_future = exercise_payoffs * np.power(step_discount, exercise_steps - step)
-        continuation = np.full(n_paths, float(np.mean(discounted_future[candidates])) if candidates.any() else 0.0)
+        fallback = (
+            float(np.mean(discounted_future[candidates]))
+            if candidates.any()
+            else float(np.mean(discounted_future))
+        )
+        fallback_continuation[step] = fallback
+        continuation = np.full(n_paths, fallback, dtype=float)
         model_status = "constant_fallback"
         r2 = float("nan")
         rows = int(candidates.sum())
 
         if rows >= regression.min_regression_paths and np.std(discounted_future[candidates]) > 1e-12:
+            step_variance = clean_variance_feature(variances, step, n_paths)
             features, feature_names = american_regression_features(
                 prices=prices[candidates, step],
-                variances=None if variances is None else variances[candidates, step],
+                variances=step_variance[candidates],
                 contract=contract,
                 regression=regression,
             )
@@ -163,17 +240,18 @@ def value_american_option_lsmc(
             )
             all_features, _ = american_regression_features(
                 prices=prices[:, step],
-                variances=clean_variance_feature(variances, step, n_paths),
+                variances=step_variance,
                 contract=contract,
                 regression=regression,
             )
             continuation = model.predict(all_features)
+            continuation_models[step] = model
             r2 = model.r2
             model_status = "ridge"
 
         if regression.clip_negative_continuation:
             continuation = np.maximum(continuation, 0.0)
-        exercise_now = candidates & (immediate > continuation)
+        exercise_now = candidates & (immediate > continuation + regression.exercise_tolerance)
         exercise_steps[exercise_now] = step
         exercise_payoffs[exercise_now] = immediate[exercise_now]
         diagnostics.append(
@@ -188,11 +266,24 @@ def value_american_option_lsmc(
             }
         )
 
-    path_values = exercise_payoffs * np.power(step_discount, exercise_steps)
+    policy = AmericanLSMCPolicy(
+        contract=contract,
+        regression=regression,
+        maturity_step=maturity,
+        continuation_models=continuation_models,
+        fallback_continuation=fallback_continuation,
+    )
+    exercise_steps, exercise_payoffs, path_values = _forward_apply_lsmc_policy(
+        prices=prices,
+        variances=variances,
+        contract=contract,
+        policy=policy,
+        maturity=maturity,
+    )
     if contract.exercise_start_step == 0 and contract.is_exercise_step(0, maturity):
         initial_payoff = float(payoff[0, 0])
         continuation_value = float(np.mean(path_values))
-        if initial_payoff > continuation_value:
+        if initial_payoff > continuation_value + regression.exercise_tolerance:
             path_values = np.full(n_paths, initial_payoff, dtype=float)
             exercise_steps = np.zeros(n_paths, dtype=int)
             exercise_payoffs = np.full(n_paths, initial_payoff, dtype=float)
@@ -210,6 +301,7 @@ def value_american_option_lsmc(
         regression_diagnostics=pd.DataFrame(diagnostics).sort_values("step").reset_index(drop=True),
         european_value=european_value,
         european_stderr=european_stderr,
+        policy=policy,
         contract=contract,
     )
 
@@ -283,6 +375,44 @@ def _american_exercise_profile(
     profile["exercise_probability"] = profile["exercise_count"] / len(frame)
     profile["is_maturity"] = profile["step"] == maturity
     return profile
+
+
+def _forward_apply_lsmc_policy(
+    prices: np.ndarray,
+    variances: np.ndarray | None,
+    contract: AmericanOptionContract,
+    policy: AmericanLSMCPolicy,
+    maturity: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_paths = prices.shape[0]
+    payoff = contract.payoff(prices)
+    step_discount = float(np.exp(-contract.risk_free_rate * contract.time_step_years))
+    exercise_steps = np.full(n_paths, maturity, dtype=int)
+    exercise_payoffs = payoff[:, maturity].copy()
+    active = np.ones(n_paths, dtype=bool)
+
+    for step in range(contract.exercise_start_step, maturity):
+        if not contract.is_exercise_step(step, maturity):
+            continue
+        immediate = payoff[:, step]
+        candidates = active.copy()
+        if policy.regression.itm_only:
+            candidates &= immediate > policy.regression.exercise_tolerance
+        if not candidates.any():
+            continue
+        step_variance = None if variances is None else clean_variance_feature(variances, step, n_paths)
+        continuation = policy.predict_continuation_values(
+            step=step,
+            prices=prices[:, step],
+            variances=step_variance,
+        )
+        exercise_now = candidates & (immediate > continuation + policy.regression.exercise_tolerance)
+        exercise_steps[exercise_now] = step
+        exercise_payoffs[exercise_now] = immediate[exercise_now]
+        active[exercise_now] = False
+
+    path_values = exercise_payoffs * np.power(step_discount, exercise_steps)
+    return exercise_steps, exercise_payoffs, path_values
 
 
 def _skip_diagnostic(step: int, status: str, n_paths: int) -> dict[str, float | int | str]:

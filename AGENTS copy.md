@@ -133,11 +133,13 @@ Teure Experimente sollten eine schnelle Testkonfiguration haben, die lokal in ku
 
 ## Analyse- und Reportregeln
 
+- All new project documentation, root README content, analysis reports, report tables, plot titles, figure captions, and prompt files must be written in English unless the user explicitly requests another language for a specific artifact.
 - Analysen muessen reproduzierbar sein: genutzte Datenquelle, Symbol, Zeitraum, Split-Logik, Modellkonfiguration, Seed und Ausfuehrungsbefehl dokumentieren.
 - Analyseergebnisse nicht nur als lose Artefakte unter `outputs/` ablegen. Zentrale Ergebnisse gehoeren zusaetzlich in das Root-`README.md`, sofern sie fuer den Projektstand relevant sind.
 - Das Root-`README.md` soll bei relevanten Analysen Kennzahlen, kurze fachliche Interpretation, Grenzen der Aussagekraft und konkrete naechste Validierungsschritte enthalten.
 - Grafiken aus Analysen sollen im Root-`README.md` eingebunden werden, wenn sie das Ergebnis verstaendlich machen. Die Bilddateien duerfen als generierte Artefakte unter `outputs/` bleiben und muessen nicht versioniert werden.
 - Tabellen und Plots muessen klar zwischen In-sample, Validation und Test unterscheiden. Keine Ergebnisgrafik darf suggerieren, dass Testdaten fuer Training oder Feature-Erzeugung genutzt wurden.
+- Path-quality evaluation must not rely on simple point-forecast or marginal diagnostics such as RMSE, correlation, R2, MSE skill, or VaR hit rates as the main score. These may be reported only as auxiliary model diagnostics. Primary path-quality reports should use distributional scores and two-sample criteria such as Energy Score and multiband maximum mean discrepancy (MMD), computed on path-level features across multiple horizons.
 - Schlechte oder gemischte Ergebnisse gehoeren ausdruecklich in die Dokumentation. Modelle nicht schoenreden; klar benennen, welche Diagnosen gegen eine produktive Nutzung sprechen.
 
 ## Git- und Artefaktregeln

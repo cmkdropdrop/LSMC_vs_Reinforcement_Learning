@@ -31,6 +31,7 @@ pip-wheel-metadata/
 !.env.example
 *.local
 secrets.*
+/AGENTS.md
 
 # Logs
 *.log
