@@ -1,0 +1,58 @@
+name: crypto-hf-carry-development
+
+on:
+  push:
+    branches:
+      - chatgpt/high-frequency-strategy-v2-20260827
+    paths:
+      - experiments/crypto_hf_carry/**
+      - .github/workflows/crypto_hf_carry_develop.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: crypto-hf-carry-develop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  OMP_NUM_THREADS: "2"
+  MKL_NUM_THREADS: "2"
+
+jobs:
+  develop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install deterministic environment
+        run: python -m pip install numpy==2.1.3 pandas==2.2.3 requests==2.32.3
+      - name: Decode, verify, and compile research runner
+        run: |
+          echo "bc8d731bd463d9b7e5f1600bbc93174627829309a6949a2c5e1ed1dfb20b3690  experiments/crypto_hf_carry/run_carry.py.gz.b64" | sha256sum -c -
+          base64 -d experiments/crypto_hf_carry/run_carry.py.gz.b64 | gzip -d > experiments/crypto_hf_carry/run_carry.py
+          echo "4dee4c1b6f9ce2de6a98966b789285ac541353824a9d40541d1ff062817bdd4c  experiments/crypto_hf_carry/run_carry.py" | sha256sum -c -
+          python -m py_compile experiments/crypto_hf_carry/run_carry.py
+      - name: Run development walk-forward search
+        run: python experiments/crypto_hf_carry/run_carry.py --phase develop
+      - name: Record outputs
+        run: |
+          python -m pip freeze > outputs/crypto_hf_carry/develop/python_environment.txt
+          cat outputs/crypto_hf_carry/develop/frozen_config.json
+          cat outputs/crypto_hf_carry/develop/selected_fold_results.csv
+          head -21 outputs/crypto_hf_carry/develop/configuration_ranking.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crypto-hf-carry-development
+          path: outputs/crypto_hf_carry/develop
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
