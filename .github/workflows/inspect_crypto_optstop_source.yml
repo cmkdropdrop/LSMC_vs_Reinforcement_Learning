@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Decode and inspect top-level source structure
+      - name: Decode and inspect HPO-relevant source
         run: |
           base64 --decode experiments/crypto_optstop/run_experiment.py.gz.b64 | gzip -d > /tmp/run_experiment.py
           python - <<'PY'
@@ -24,13 +24,14 @@ jobs:
           from pathlib import Path
           src = Path('/tmp/run_experiment.py').read_text()
           tree = ast.parse(src)
+          wanted = {
+              'Config', 'QNetwork', 'train_model', 'select_margin',
+              'run_backtest', 'command_develop', 'make_episode_set',
+              'calculate_metrics', 'save_bundle'
+          }
           for node in tree.body:
-              if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                  targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                  names = [t.id for t in targets if isinstance(t, ast.Name)]
-                  if names:
-                      segment = ast.get_source_segment(src, node)
-                      print('ASSIGN', ','.join(names), '::', segment[:500].replace('\n',' '))
-              elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                  print(type(node).__name__.upper(), node.name)
+              name = getattr(node, 'name', None)
+              if name in wanted:
+                  print(f'===== {name} =====')
+                  print(ast.get_source_segment(src, node))
           PY
