@@ -43,18 +43,28 @@ def _scores(closes: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     return trailing.replace([np.inf, -np.inf], np.nan)
 
 
+def _utc_timestamp(value: str) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
 def run_backtest(
     opens: pd.DataFrame,
     closes: pd.DataFrame,
     config: StrategyConfig,
     start: str,
     end: str,
+    *,
+    include_trade_details: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     """Run non-overlapping round trips with next-bar-open execution.
 
     Signals use closes through bar t. Entry occurs at the open of t+1 and exit
     occurs exactly ``hold_bars`` later at the open. Each long or short position
-    opened and closed is counted as one round-trip trade.
+    opened and closed is counted as one round-trip trade. The implementation is
+    vectorized but follows the same ordering and timing rules as a bar loop.
     """
     if config.mode not in {"momentum", "reversal"}:
         raise ValueError(f"Unsupported mode: {config.mode}")
@@ -63,96 +73,132 @@ def run_backtest(
     if not opens.index.equals(closes.index) or list(opens.columns) != list(closes.columns):
         raise ValueError("Open and close panels must be aligned")
 
-    score = _scores(closes, config)
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-    if start_ts.tzinfo is None:
-        start_ts = start_ts.tz_localize("UTC")
-    else:
-        start_ts = start_ts.tz_convert("UTC")
-    if end_ts.tzinfo is None:
-        end_ts = end_ts.tz_localize("UTC")
-    else:
-        end_ts = end_ts.tz_convert("UTC")
-
+    start_ts = _utc_timestamp(start)
+    end_ts = _utc_timestamp(end)
     interval = pd.Timedelta(minutes=config.bar_minutes)
     hold_delta = interval * config.hold_bars
-    epoch_bar = opens.index.view("int64") // interval.value
-    entry_mask = (epoch_bar % config.hold_bars) == 0
-    candidate_entries = np.flatnonzero(entry_mask)
+    index_ns = opens.index.asi8
 
-    cycles: list[dict[str, object]] = []
-    trades: list[dict[str, object]] = []
+    epoch_bar = index_ns // interval.value
+    entry_positions = np.flatnonzero((epoch_bar % config.hold_bars) == 0)
+    signal_positions = entry_positions - 1
+    exit_positions = entry_positions + config.hold_bars
+    valid = (signal_positions >= 0) & (exit_positions < len(opens))
+    entry_positions = entry_positions[valid]
+    signal_positions = signal_positions[valid]
+    exit_positions = exit_positions[valid]
+
+    valid = (
+        (index_ns[entry_positions] >= start_ts.value)
+        & (index_ns[exit_positions] <= end_ts.value)
+        & ((index_ns[entry_positions] - index_ns[signal_positions]) == interval.value)
+        & ((index_ns[exit_positions] - index_ns[entry_positions]) == hold_delta.value)
+    )
+    entry_positions = entry_positions[valid]
+    signal_positions = signal_positions[valid]
+    exit_positions = exit_positions[valid]
+
+    if len(entry_positions) == 0:
+        empty = pd.DataFrame()
+        return empty, empty, calculate_metrics(empty, empty, config)
+
+    score_rows = _scores(closes, config).to_numpy(dtype=float)[signal_positions]
+    finite_scores = np.isfinite(score_rows)
+    valid = finite_scores.sum(axis=1) >= config.top_k * 2
+    entry_positions = entry_positions[valid]
+    signal_positions = signal_positions[valid]
+    exit_positions = exit_positions[valid]
+    score_rows = score_rows[valid]
+    finite_scores = finite_scores[valid]
+
+    if len(entry_positions) == 0:
+        empty = pd.DataFrame()
+        return empty, empty, calculate_metrics(empty, empty, config)
+
+    sortable = np.where(finite_scores, score_rows, np.inf)
+    sorted_indices = np.argsort(sortable, axis=1, kind="stable")
+    low_indices = sorted_indices[:, : config.top_k]
+    high_indices = sorted_indices[:, -config.top_k :]
+    if config.mode == "momentum":
+        long_indices, short_indices = high_indices, low_indices
+    else:
+        long_indices, short_indices = low_indices, high_indices
+
+    open_values = opens.to_numpy(dtype=float)
+    entry_rows = open_values[entry_positions]
+    exit_rows = open_values[exit_positions]
+    long_entry = np.take_along_axis(entry_rows, long_indices, axis=1)
+    long_exit = np.take_along_axis(exit_rows, long_indices, axis=1)
+    short_entry = np.take_along_axis(entry_rows, short_indices, axis=1)
+    short_exit = np.take_along_axis(exit_rows, short_indices, axis=1)
+
+    valid = (
+        np.isfinite(long_entry).all(axis=1)
+        & np.isfinite(long_exit).all(axis=1)
+        & np.isfinite(short_entry).all(axis=1)
+        & np.isfinite(short_exit).all(axis=1)
+        & (long_entry > 0.0).all(axis=1)
+        & (short_entry > 0.0).all(axis=1)
+    )
+    entry_positions = entry_positions[valid]
+    signal_positions = signal_positions[valid]
+    exit_positions = exit_positions[valid]
+    long_indices = long_indices[valid]
+    short_indices = short_indices[valid]
+    long_entry = long_entry[valid]
+    long_exit = long_exit[valid]
+    short_entry = short_entry[valid]
+    short_exit = short_exit[valid]
+
+    long_returns = long_exit / long_entry - 1.0
+    short_returns = 1.0 - short_exit / short_entry
+    selected_returns = np.concatenate([long_returns, short_returns], axis=1)
+    gross_cycles = selected_returns.mean(axis=1)
     cost = config.roundtrip_cost_bps / 10000.0
+    net_cycles = gross_cycles - cost
 
-    for entry_pos in candidate_entries:
-        signal_pos = entry_pos - 1
-        exit_pos = entry_pos + config.hold_bars
-        if signal_pos < 0 or exit_pos >= len(opens):
-            continue
-        entry_time = opens.index[entry_pos]
-        signal_time = opens.index[signal_pos] + interval
-        exit_time = opens.index[exit_pos]
-        if entry_time < start_ts or exit_time > end_ts:
-            continue
-        if entry_time - opens.index[signal_pos] != interval:
-            continue
-        if exit_time - entry_time != hold_delta:
-            continue
+    signal_times = opens.index.take(signal_positions) + interval
+    entry_times = opens.index.take(entry_positions)
+    exit_times = opens.index.take(exit_positions)
+    cycle_data: dict[str, object] = {
+        "signal_time": signal_times,
+        "entry_time": entry_times,
+        "exit_time": exit_times,
+        "gross_return": gross_cycles,
+        "net_return": net_cycles,
+    }
+    symbols = np.asarray(opens.columns, dtype=object)
+    if include_trade_details:
+        cycle_data["long_symbols"] = [
+            ",".join(symbols[row].tolist()) for row in long_indices
+        ]
+        cycle_data["short_symbols"] = [
+            ",".join(symbols[row].tolist()) for row in short_indices
+        ]
+    cycle_frame = pd.DataFrame(cycle_data)
 
-        row = score.iloc[signal_pos].dropna().sort_values()
-        if len(row) < config.top_k * 2:
-            continue
-        low = row.index[: config.top_k].tolist()
-        high = row.index[-config.top_k :].tolist()
-        if config.mode == "momentum":
-            long_symbols, short_symbols = high, low
-        else:
-            long_symbols, short_symbols = low, high
-
-        entry_prices = opens.iloc[entry_pos]
-        exit_prices = opens.iloc[exit_pos]
-        if not np.isfinite(entry_prices[long_symbols + short_symbols]).all():
-            continue
-        if not np.isfinite(exit_prices[long_symbols + short_symbols]).all():
-            continue
-
-        long_returns = exit_prices[long_symbols] / entry_prices[long_symbols] - 1.0
-        short_returns = 1.0 - exit_prices[short_symbols] / entry_prices[short_symbols]
-        leg_returns = pd.concat([long_returns, short_returns])
-        gross_cycle = float(leg_returns.mean())
-        net_cycle = gross_cycle - cost
-        cycles.append({
-            "signal_time": signal_time,
-            "entry_time": entry_time,
-            "exit_time": exit_time,
-            "gross_return": gross_cycle,
-            "net_return": net_cycle,
-            "long_symbols": ",".join(long_symbols),
-            "short_symbols": ",".join(short_symbols),
+    selected_indices = np.concatenate([long_indices, short_indices], axis=1)
+    selected_entries = np.concatenate([long_entry, short_entry], axis=1)
+    selected_exits = np.concatenate([long_exit, short_exit], axis=1)
+    legs_per_cycle = config.top_k * 2
+    sides = np.asarray(["LONG"] * config.top_k + ["SHORT"] * config.top_k, dtype=object)
+    trade_data: dict[str, object] = {
+        "signal_time": np.repeat(signal_times.to_numpy(), legs_per_cycle),
+        "entry_time": np.repeat(entry_times.to_numpy(), legs_per_cycle),
+        "exit_time": np.repeat(exit_times.to_numpy(), legs_per_cycle),
+        "gross_return": selected_returns.reshape(-1),
+        "net_return": (selected_returns - cost).reshape(-1),
+        "roundtrip_cost_bps": np.full(len(selected_returns) * legs_per_cycle, config.roundtrip_cost_bps),
+    }
+    if include_trade_details:
+        trade_data.update({
+            "symbol": symbols[selected_indices].reshape(-1),
+            "side": np.tile(sides, len(selected_returns)),
+            "entry_price": selected_entries.reshape(-1),
+            "exit_price": selected_exits.reshape(-1),
         })
+    trade_frame = pd.DataFrame(trade_data)
 
-        for side, symbols, returns in (
-            ("LONG", long_symbols, long_returns),
-            ("SHORT", short_symbols, short_returns),
-        ):
-            for symbol in symbols:
-                leg_net = float(returns[symbol]) - cost
-                trades.append({
-                    "signal_time": signal_time,
-                    "entry_time": entry_time,
-                    "exit_time": exit_time,
-                    "symbol": symbol,
-                    "side": side,
-                    "entry_price": float(entry_prices[symbol]),
-                    "exit_price": float(exit_prices[symbol]),
-                    "gross_return": float(returns[symbol]),
-                    "net_return": leg_net,
-                    "roundtrip_cost_bps": config.roundtrip_cost_bps,
-                })
-
-    cycle_frame = pd.DataFrame(cycles)
-    trade_frame = pd.DataFrame(trades)
     metrics = calculate_metrics(cycle_frame, trade_frame, config)
     return cycle_frame, trade_frame, metrics
 
