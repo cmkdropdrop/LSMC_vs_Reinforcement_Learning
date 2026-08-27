@@ -16,21 +16,30 @@ class StrategyConfig:
     volatility_window_bars: int
     top_k: int
     roundtrip_cost_bps: float
+    dispersion_quantile: float = 0.0
+    dispersion_window_bars: int = 8640
     bar_minutes: int = 5
 
     @property
     def config_id(self) -> str:
         vol = f"v{self.volatility_window_bars}" if self.volatility_window_bars else "raw"
+        gate = f"q{int(round(self.dispersion_quantile * 100)):02d}"
         return (
             f"{self.mode}_l{self.lookback_bars}_h{self.hold_bars}_"
-            f"{vol}_k{self.top_k}_c{self.roundtrip_cost_bps:g}"
+            f"{vol}_{gate}_k{self.top_k}_c{self.roundtrip_cost_bps:g}"
         )
 
     def to_dict(self) -> dict[str, object]:
         return {"config_id": self.config_id, **asdict(self)}
 
 
-def _scores(closes: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+def prepare_signal_data(
+    closes: pd.DataFrame,
+    config: StrategyConfig,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Compute causal cross-sectional scores and a past-only dispersion gate."""
+    if not 0.0 <= config.dispersion_quantile < 1.0:
+        raise ValueError("dispersion_quantile must be in [0, 1)")
     log_close = np.log(closes)
     trailing = log_close.diff(config.lookback_bars)
     if config.volatility_window_bars > 0:
@@ -40,7 +49,21 @@ def _scores(closes: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
             min_periods=config.volatility_window_bars,
         ).std(ddof=1) * np.sqrt(config.lookback_bars)
         trailing = trailing / scale.replace(0.0, np.nan)
-    return trailing.replace([np.inf, -np.inf], np.nan)
+    scores = trailing.replace([np.inf, -np.inf], np.nan)
+    dispersion = scores.max(axis=1, skipna=True) - scores.min(axis=1, skipna=True)
+    if config.dispersion_quantile <= 0.0:
+        threshold = pd.Series(-np.inf, index=scores.index, name="dispersion_threshold")
+    else:
+        threshold = (
+            dispersion.rolling(
+                config.dispersion_window_bars,
+                min_periods=config.dispersion_window_bars,
+            )
+            .quantile(config.dispersion_quantile)
+            .shift(1)
+            .rename("dispersion_threshold")
+        )
+    return scores, threshold
 
 
 def _utc_timestamp(value: str) -> pd.Timestamp:
@@ -58,13 +81,15 @@ def run_backtest(
     end: str,
     *,
     include_trade_details: bool = True,
+    prepared_scores: pd.DataFrame | None = None,
+    prepared_threshold: pd.Series | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
     """Run non-overlapping round trips with next-bar-open execution.
 
     Signals use closes through bar t. Entry occurs at the open of t+1 and exit
     occurs exactly ``hold_bars`` later at the open. Each long or short position
-    opened and closed is counted as one round-trip trade. The implementation is
-    vectorized but follows the same ordering and timing rules as a bar loop.
+    opened and closed is counted as one round-trip trade. A dispersion gate, if
+    configured, is estimated only from observations preceding the signal bar.
     """
     if config.mode not in {"momentum", "reversal"}:
         raise ValueError(f"Unsupported mode: {config.mode}")
@@ -72,6 +97,13 @@ def run_backtest(
         raise ValueError("top_k is incompatible with the number of symbols")
     if not opens.index.equals(closes.index) or list(opens.columns) != list(closes.columns):
         raise ValueError("Open and close panels must be aligned")
+
+    if prepared_scores is None or prepared_threshold is None:
+        scores, dispersion_threshold = prepare_signal_data(closes, config)
+    else:
+        scores, dispersion_threshold = prepared_scores, prepared_threshold
+    if not scores.index.equals(opens.index) or not dispersion_threshold.index.equals(opens.index):
+        raise ValueError("Prepared signal data must align with the market panel")
 
     start_ts = _utc_timestamp(start)
     end_ts = _utc_timestamp(end)
@@ -102,14 +134,26 @@ def run_backtest(
         empty = pd.DataFrame()
         return empty, empty, calculate_metrics(empty, empty, config)
 
-    score_rows = _scores(closes, config).to_numpy(dtype=float)[signal_positions]
+    score_values = scores.to_numpy(dtype=float)
+    score_rows = score_values[signal_positions]
     finite_scores = np.isfinite(score_rows)
-    valid = finite_scores.sum(axis=1) >= config.top_k * 2
+    dispersion_values = (
+        np.nanmax(score_rows, axis=1) - np.nanmin(score_rows, axis=1)
+    )
+    threshold_values = dispersion_threshold.to_numpy(dtype=float)[signal_positions]
+    valid = (
+        (finite_scores.sum(axis=1) >= config.top_k * 2)
+        & np.isfinite(dispersion_values)
+        & np.isfinite(threshold_values)
+        & (dispersion_values >= threshold_values)
+    )
     entry_positions = entry_positions[valid]
     signal_positions = signal_positions[valid]
     exit_positions = exit_positions[valid]
     score_rows = score_rows[valid]
     finite_scores = finite_scores[valid]
+    dispersion_values = dispersion_values[valid]
+    threshold_values = threshold_values[valid]
 
     if len(entry_positions) == 0:
         empty = pd.DataFrame()
@@ -149,6 +193,8 @@ def run_backtest(
     long_exit = long_exit[valid]
     short_entry = short_entry[valid]
     short_exit = short_exit[valid]
+    dispersion_values = dispersion_values[valid]
+    threshold_values = threshold_values[valid]
 
     long_returns = long_exit / long_entry - 1.0
     short_returns = 1.0 - short_exit / short_entry
@@ -164,6 +210,8 @@ def run_backtest(
         "signal_time": signal_times,
         "entry_time": entry_times,
         "exit_time": exit_times,
+        "score_dispersion": dispersion_values,
+        "dispersion_threshold": threshold_values,
         "gross_return": gross_cycles,
         "net_return": net_cycles,
     }
