@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -81,6 +82,14 @@ def read_month(path: Path, symbol: str) -> pd.DataFrame:
     return frame[["open_time", "open", "close", "symbol"]]
 
 
+def _fetch_verified(
+    task: tuple[str, str, str, Path],
+) -> tuple[str, Path, str]:
+    symbol, interval, month, cache = task
+    path = download_month(symbol, interval, month, cache)
+    return symbol, path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def load_panel(
     symbols: list[str],
     interval: str,
@@ -89,13 +98,19 @@ def load_panel(
     cache: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, str]]:
     """Load synchronized open and close panels for all symbols."""
+    tasks = [
+        (symbol, interval, month, cache)
+        for symbol in symbols
+        for month in month_range(first_month, last_month)
+    ]
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        verified = list(executor.map(_fetch_verified, tasks))
+
     frames: list[pd.DataFrame] = []
     checksums: dict[str, str] = {}
-    for symbol in symbols:
-        for month in month_range(first_month, last_month):
-            path = download_month(symbol, interval, month, cache)
-            checksums[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-            frames.append(read_month(path, symbol))
+    for symbol, path, checksum in verified:
+        checksums[path.name] = checksum
+        frames.append(read_month(path, symbol))
 
     raw = pd.concat(frames, ignore_index=True)
     raw = raw.drop_duplicates(["symbol", "open_time"], keep="last")
