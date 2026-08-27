@@ -1,0 +1,22 @@
+name: inspect-high-frequency-data
+
+on:
+  push:
+    branches:
+      - chatgpt/high-frequency-strategy-20260827
+    paths:
+      - experiments/high_frequency/inspect_data.py
+      - .github/workflows/inspect_high_frequency_data.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect curated SQLite input
+        run: python experiments/high_frequency/inspect_data.py
