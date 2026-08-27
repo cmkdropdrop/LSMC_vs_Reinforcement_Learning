@@ -1,0 +1,149 @@
+{
+  "description": "Pre-OOS walk-forward HPO. The consumed 2026-02-01..2026-08-01 OOS window is never loaded.",
+  "margin_candidates_pp": [-0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.5],
+  "folds": [
+    {
+      "fold_id": "F1",
+      "train_end": "2023-07-01T00:00:00Z",
+      "model_val_end": "2023-11-01T00:00:00Z",
+      "margin_val_end": "2024-02-01T00:00:00Z",
+      "dev_test_end": "2024-08-01T00:00:00Z",
+      "develop_last_month": "2024-07"
+    },
+    {
+      "fold_id": "F2",
+      "train_end": "2024-01-01T00:00:00Z",
+      "model_val_end": "2024-05-01T00:00:00Z",
+      "margin_val_end": "2024-08-01T00:00:00Z",
+      "dev_test_end": "2025-02-01T00:00:00Z",
+      "develop_last_month": "2025-01"
+    },
+    {
+      "fold_id": "F3",
+      "train_end": "2024-07-01T00:00:00Z",
+      "model_val_end": "2024-11-01T00:00:00Z",
+      "margin_val_end": "2025-02-01T00:00:00Z",
+      "dev_test_end": "2025-08-01T00:00:00Z",
+      "develop_last_month": "2025-07"
+    },
+    {
+      "fold_id": "F4",
+      "train_end": "2025-01-01T00:00:00Z",
+      "model_val_end": "2025-05-01T00:00:00Z",
+      "margin_val_end": "2025-08-01T00:00:00Z",
+      "dev_test_end": "2026-02-01T00:00:00Z",
+      "develop_last_month": "2026-01"
+    }
+  ],
+  "configs": [
+    {
+      "config_id": "C00_baseline",
+      "hidden": [128, 128, 64],
+      "dropout": 0.05,
+      "learning_rate": 0.001,
+      "weight_decay": 0.0001,
+      "batch_size": 8192,
+      "initial_fit_epochs": 3,
+      "policy_iterations": 7,
+      "epochs_per_iteration": 2,
+      "max_hold_hours": 240,
+      "min_hold_hours": 6
+    },
+    {
+      "config_id": "C01_compact_regularized",
+      "hidden": [64, 64, 32],
+      "dropout": 0.1,
+      "learning_rate": 0.0005,
+      "weight_decay": 0.0005,
+      "batch_size": 8192,
+      "initial_fit_epochs": 4,
+      "policy_iterations": 5,
+      "epochs_per_iteration": 2,
+      "max_hold_hours": 168,
+      "min_hold_hours": 12
+    },
+    {
+      "config_id": "C02_medium_low_lr",
+      "hidden": [128, 64, 32],
+      "dropout": 0.0,
+      "learning_rate": 0.0003,
+      "weight_decay": 0.0001,
+      "batch_size": 4096,
+      "initial_fit_epochs": 4,
+      "policy_iterations": 5,
+      "epochs_per_iteration": 2,
+      "max_hold_hours": 120,
+      "min_hold_hours": 6
+    },
+    {
+      "config_id": "C03_wide_regularized",
+      "hidden": [256, 128, 64],
+      "dropout": 0.1,
+      "learning_rate": 0.0005,
+      "weight_decay": 0.001,
+      "batch_size": 8192,
+      "initial_fit_epochs": 3,
+      "policy_iterations": 3,
+      "epochs_per_iteration": 2,
+      "max_hold_hours": 168,
+      "min_hold_hours": 6
+    },
+    {
+      "config_id": "C04_compact_short_horizon",
+      "hidden": [64, 32],
+      "dropout": 0.15,
+      "learning_rate": 0.001,
+      "weight_decay": 0.001,
+      "batch_size": 4096,
+      "initial_fit_epochs": 3,
+      "policy_iterations": 3,
+      "epochs_per_iteration": 2,
+      "max_hold_hours": 96,
+      "min_hold_hours": 6
+    },
+    {
+      "config_id": "C05_deep_long_horizon",
+      "hidden": [128, 128, 128, 64],
+      "dropout": 0.05,
+      "learning_rate": 0.0003,
+      "weight_decay": 0.0001,
+      "batch_size": 8192,
+      "initial_fit_epochs": 4,
+      "policy_iterations": 5,
+      "epochs_per_iteration": 1,
+      "max_hold_hours": 240,
+      "min_hold_hours": 12
+    },
+    {
+      "config_id": "C06_medium_low_decay",
+      "hidden": [128, 64, 32],
+      "dropout": 0.05,
+      "learning_rate": 0.0007,
+      "weight_decay": 0.00001,
+      "batch_size": 8192,
+      "initial_fit_epochs": 3,
+      "policy_iterations": 5,
+      "epochs_per_iteration": 2,
+      "max_hold_hours": 168,
+      "min_hold_hours": 3
+    },
+    {
+      "config_id": "C07_wide_short_no_dropout",
+      "hidden": [256, 128],
+      "dropout": 0.0,
+      "learning_rate": 0.001,
+      "weight_decay": 0.00001,
+      "batch_size": 8192,
+      "initial_fit_epochs": 3,
+      "policy_iterations": 7,
+      "epochs_per_iteration": 1,
+      "max_hold_hours": 120,
+      "min_hold_hours": 3
+    }
+  ],
+  "objective": {
+    "fold_utility": "clip(sharpe,-5,5) + 0.04*return_pct + 0.02*max_drawdown_pct + 0.20*log(clip(profit_factor,0.05,20)) - 0.10*max(0,8-trades)",
+    "robust_score": "0.65*median(fold_utility) + 0.35*min(fold_utility) - 0.25*std(fold_utility) - 0.50*fraction_negative_return_folds",
+    "seed_confirmation": "Top 3 configurations are rerun on F4 with two additional fixed seeds; final score subtracts 0.30*std(seed_fold_utility)."
+  }
+}
