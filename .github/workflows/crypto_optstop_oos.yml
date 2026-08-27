@@ -1,0 +1,123 @@
+name: crypto-optstop-untouched-oos
+
+on:
+  push:
+    branches:
+      - chatgpt/crypto-optstop-oos-20260827
+    paths:
+      - experiments/crypto_optstop/**
+      - .github/workflows/crypto_optstop_oos.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: crypto-optstop-oos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  MPLBACKEND: Agg
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  develop:
+    name: Develop, validate, and freeze without OOS data
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out the experiment branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Decode and syntax-check the exact experiment source
+        run: |
+          mkdir -p /tmp/crypto_optstop
+          base64 --decode experiments/crypto_optstop/run_experiment.py.gz.b64 \
+            | gzip --decompress > /tmp/crypto_optstop/run_experiment.py
+          python -m py_compile /tmp/crypto_optstop/run_experiment.py
+          sha256sum /tmp/crypto_optstop/run_experiment.py
+
+      - name: Install deterministic CPU research environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 matplotlib==3.9.2 requests==2.32.3 tabulate==0.9.0
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Train, validate, development-test, and freeze
+        run: |
+          python /tmp/crypto_optstop/run_experiment.py develop \
+            --output-dir frozen_bundle \
+            --cache-dir .cache/develop
+          python -m pip freeze > frozen_bundle/python_environment.txt
+          find frozen_bundle -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+      - name: Publish the immutable frozen development bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-optstop-frozen-bundle
+          path: frozen_bundle
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  oos:
+    name: Inference-only bar-by-bar six-month OOS
+    needs: develop
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the frozen experiment source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Decode and syntax-check the exact experiment source
+        run: |
+          mkdir -p /tmp/crypto_optstop
+          base64 --decode experiments/crypto_optstop/run_experiment.py.gz.b64 \
+            | gzip --decompress > /tmp/crypto_optstop/run_experiment.py
+          python -m py_compile /tmp/crypto_optstop/run_experiment.py
+          sha256sum /tmp/crypto_optstop/run_experiment.py
+
+      - name: Install the identical CPU inference environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 matplotlib==3.9.2 requests==2.32.3 tabulate==0.9.0
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Retrieve only the frozen bundle from the development job
+        uses: actions/download-artifact@v4
+        with:
+          name: crypto-optstop-frozen-bundle
+          path: frozen_bundle
+
+      - name: Execute untouched OOS inference without fitting
+        run: |
+          python /tmp/crypto_optstop/run_experiment.py oos \
+            --bundle-dir frozen_bundle \
+            --output-dir oos_results \
+            --cache-dir .cache/oos
+          python -m pip freeze > oos_results/python_environment.txt
+          find oos_results -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          cat oos_results/oos_metrics.json
+
+      - name: Publish all OOS trades, Q paths, metrics, and plots
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-optstop-oos-results
+          path: oos_results
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
