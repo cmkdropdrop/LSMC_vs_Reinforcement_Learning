@@ -1,0 +1,35 @@
+name: inspect-crypto-optstop-runtime
+
+on:
+  push:
+    branches:
+      - chatgpt/crypto-optstop-hpo-20260827
+    paths:
+      - .github/workflows/inspect_crypto_optstop_runtime.yml
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decode and inspect runtime API
+        run: |
+          base64 --decode experiments/crypto_optstop/run_experiment.py.gz.b64 | gzip -d > /tmp/run_experiment.py
+          python - <<'PY'
+          import dataclasses, importlib.util, inspect, json
+          spec = importlib.util.spec_from_file_location('base', '/tmp/run_experiment.py')
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          print('CONFIG_SIGNATURE', inspect.signature(mod.Config))
+          print('CFG', json.dumps(dataclasses.asdict(mod.CFG), indent=2, default=str))
+          for name in ['train_model','select_margin','run_backtest','command_develop','make_episode_set','build_features','download_binance_months']:
+              obj=getattr(mod,name)
+              print('SIGNATURE', name, inspect.signature(obj))
+          print('CONFIG_FROZEN', mod.Config.__dataclass_params__.frozen)
+          print('COMMAND_DEVELOP_SOURCE')
+          print(inspect.getsource(mod.command_develop))
+          PY
