@@ -46,15 +46,25 @@ jobs:
           source = path.read_text(encoding="utf-8")
           changes = {
               '[1, 3, 6], [6, 9, 12], [8, 10], [0., .5, 1.], [20, 28], [0., 10., 20.], ["equal", "edge"]':
-                  '[1, 3, 6], [6, 9, 12], [12, 14], [0., 1.], [20], [0., 20.], ["edge"]',
+                  '[1, 3, 6], [6, 9, 12], [8, 10, 12], [0., 1.], [20, 28], [0., 10., 20.], ["edge"]',
+              'freq="8h"':
+                  'freq="4h"',
               'valid = frow.gt(0) & score.notna() & vrow.notna() & lrow.notna()':
                   'valid = frow.notna() & score.notna() & vrow.notna() & lrow.notna()',
+              'allocation = config.target_gross / config.hold_events':
+                  'allocation = config.target_gross / (config.hold_events * 2.0)',
+              'math.sqrt(365 * 3)':
+                  'math.sqrt(365 * 6)',
               'pd.Series(config.top_k * 2, index=em)':
                   'pd.Series(config.top_k, index=em)',
               '"round_trip_trades": float(len(f) * config.top_k * 2)':
                   '"round_trip_trades": float(len(f) * config.top_k)',
               'completed leg round trips':
                   'completed delta-neutral pair round trips',
+              'ff = pd.DataFrame(rows); rank = summarize(ff); eligible = rank[rank.complete_folds & rank.frequency_constraint_met]\n    if eligible.empty: raise RuntimeError("No configuration met frequency constraint")':
+                  'ff = pd.DataFrame(rows); rank = summarize(ff)\n    ff.to_csv(output / "fold_results.csv", index=False); rank.to_csv(output / "configuration_ranking.csv", index=False)\n    eligible = rank[rank.complete_folds & rank.frequency_constraint_met]\n    if eligible.empty:\n        print("No eligible configuration. Diagnostic ranking:\\n", rank.head(30).to_string(index=False))\n        raise RuntimeError("No configuration met frequency constraint")',
+              'ff.to_csv(output / "fold_results.csv", index=False); rank.to_csv(output / "configuration_ranking.csv", index=False)\n    selected =':
+                  'selected =',
           }
           for old, new in changes.items():
               if old not in source:
@@ -65,17 +75,26 @@ jobs:
           sha256sum experiments/crypto_hf_carry/run_carry.py
           python -m py_compile experiments/crypto_hf_carry/run_carry.py
       - name: Run development walk-forward search
+        id: research
+        continue-on-error: true
         run: python experiments/crypto_hf_carry/run_carry.py --phase develop
       - name: Record outputs
+        if: always()
         run: |
+          mkdir -p outputs/crypto_hf_carry/develop
           python -m pip freeze > outputs/crypto_hf_carry/develop/python_environment.txt
-          cat outputs/crypto_hf_carry/develop/frozen_config.json
-          cat outputs/crypto_hf_carry/develop/selected_fold_results.csv
-          head -21 outputs/crypto_hf_carry/develop/configuration_ranking.csv
+          find outputs/crypto_hf_carry/develop -maxdepth 2 -type f -printf '%P %s bytes\n' | sort
+          test ! -f outputs/crypto_hf_carry/develop/frozen_config.json || cat outputs/crypto_hf_carry/develop/frozen_config.json
+          test ! -f outputs/crypto_hf_carry/develop/selected_fold_results.csv || cat outputs/crypto_hf_carry/develop/selected_fold_results.csv
+          test ! -f outputs/crypto_hf_carry/develop/configuration_ranking.csv || head -31 outputs/crypto_hf_carry/develop/configuration_ranking.csv
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: crypto-hf-carry-development
           path: outputs/crypto_hf_carry/develop
           if-no-files-found: error
           retention-days: 7
           compression-level: 6
+      - name: Enforce research success
+        if: steps.research.outcome != 'success'
+        run: exit 1
