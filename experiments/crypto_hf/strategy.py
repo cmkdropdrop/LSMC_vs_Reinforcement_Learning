@@ -73,6 +73,18 @@ def _utc_timestamp(value: str) -> pd.Timestamp:
     return timestamp.tz_convert("UTC")
 
 
+def _empty_result(config: StrategyConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    cycles = pd.DataFrame(columns=[
+        "signal_time", "entry_time", "exit_time", "score_dispersion",
+        "dispersion_threshold", "gross_return", "net_return",
+    ])
+    trades = pd.DataFrame(columns=[
+        "signal_time", "entry_time", "exit_time", "gross_return",
+        "net_return", "roundtrip_cost_bps",
+    ])
+    return cycles, trades, calculate_metrics(cycles, trades, config)
+
+
 def run_backtest(
     opens: pd.DataFrame,
     closes: pd.DataFrame,
@@ -84,13 +96,7 @@ def run_backtest(
     prepared_scores: pd.DataFrame | None = None,
     prepared_threshold: pd.Series | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
-    """Run non-overlapping round trips with next-bar-open execution.
-
-    Signals use closes through bar t. Entry occurs at the open of t+1 and exit
-    occurs exactly ``hold_bars`` later at the open. Each long or short position
-    opened and closed is counted as one round-trip trade. A dispersion gate, if
-    configured, is estimated only from observations preceding the signal bar.
-    """
+    """Run non-overlapping round trips with next-bar-open execution."""
     if config.mode not in {"momentum", "reversal"}:
         raise ValueError(f"Unsupported mode: {config.mode}")
     if config.top_k < 1 or config.top_k * 2 > len(opens.columns):
@@ -129,22 +135,18 @@ def run_backtest(
     entry_positions = entry_positions[valid]
     signal_positions = signal_positions[valid]
     exit_positions = exit_positions[valid]
-
     if len(entry_positions) == 0:
-        empty = pd.DataFrame()
-        return empty, empty, calculate_metrics(empty, empty, config)
+        return _empty_result(config)
 
-    score_values = scores.to_numpy(dtype=float)
-    score_rows = score_values[signal_positions]
+    score_rows = scores.to_numpy(dtype=float)[signal_positions]
     finite_scores = np.isfinite(score_rows)
-    dispersion_values = (
-        np.nanmax(score_rows, axis=1) - np.nanmin(score_rows, axis=1)
-    )
+    with np.errstate(all="ignore"):
+        dispersion_values = np.nanmax(score_rows, axis=1) - np.nanmin(score_rows, axis=1)
     threshold_values = dispersion_threshold.to_numpy(dtype=float)[signal_positions]
     valid = (
         (finite_scores.sum(axis=1) >= config.top_k * 2)
         & np.isfinite(dispersion_values)
-        & np.isfinite(threshold_values)
+        & ~np.isnan(threshold_values)
         & (dispersion_values >= threshold_values)
     )
     entry_positions = entry_positions[valid]
@@ -154,10 +156,8 @@ def run_backtest(
     finite_scores = finite_scores[valid]
     dispersion_values = dispersion_values[valid]
     threshold_values = threshold_values[valid]
-
     if len(entry_positions) == 0:
-        empty = pd.DataFrame()
-        return empty, empty, calculate_metrics(empty, empty, config)
+        return _empty_result(config)
 
     sortable = np.where(finite_scores, score_rows, np.inf)
     sorted_indices = np.argsort(sortable, axis=1, kind="stable")
@@ -195,6 +195,8 @@ def run_backtest(
     short_exit = short_exit[valid]
     dispersion_values = dispersion_values[valid]
     threshold_values = threshold_values[valid]
+    if len(entry_positions) == 0:
+        return _empty_result(config)
 
     long_returns = long_exit / long_entry - 1.0
     short_returns = 1.0 - short_exit / short_entry
@@ -246,7 +248,6 @@ def run_backtest(
             "exit_price": selected_exits.reshape(-1),
         })
     trade_frame = pd.DataFrame(trade_data)
-
     metrics = calculate_metrics(cycle_frame, trade_frame, config)
     return cycle_frame, trade_frame, metrics
 
