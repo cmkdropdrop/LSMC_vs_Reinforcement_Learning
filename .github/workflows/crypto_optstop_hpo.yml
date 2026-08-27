@@ -1,0 +1,303 @@
+name: crypto-optstop-preoos-hpo
+
+on:
+  push:
+    branches:
+      - chatgpt/crypto-optstop-hpo-20260827
+    paths:
+      - experiments/crypto_optstop/hpo_search_space.json
+      - experiments/crypto_optstop/run_hpo_trial.py
+      - experiments/crypto_optstop/aggregate_hpo.py
+      - .github/workflows/crypto_optstop_hpo.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: crypto-optstop-hpo-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  MPLBACKEND: Agg
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  OMP_NUM_THREADS: "2"
+  MKL_NUM_THREADS: "2"
+
+jobs:
+  prepare:
+    name: Prepare verified pre-OOS data and HPO matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deterministic CPU environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 matplotlib==3.9.2 requests==2.32.3 tabulate==0.9.0
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Decode and syntax-check base runner
+        run: |
+          mkdir -p /tmp/crypto_optstop
+          base64 --decode experiments/crypto_optstop/run_experiment.py.gz.b64 \
+            | gzip --decompress > /tmp/crypto_optstop/run_experiment.py
+          python -m py_compile /tmp/crypto_optstop/run_experiment.py
+          python -m py_compile experiments/crypto_optstop/run_hpo_trial.py experiments/crypto_optstop/aggregate_hpo.py
+
+      - name: Build immutable HPO matrix
+        id: matrix
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          search = json.loads(Path('experiments/crypto_optstop/hpo_search_space.json').read_text())
+
+          def encode(value):
+              raw = json.dumps(value, separators=(',', ':'), sort_keys=True).encode()
+              return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+          include = []
+          for config in search['configs']:
+              configured = dict(config)
+              configured['margin_candidates_pp'] = search['margin_candidates_pp']
+              for fold in search['folds']:
+                  include.append({
+                      'config_id': configured['config_id'],
+                      'fold_id': fold['fold_id'],
+                      'config_b64': encode(configured),
+                      'fold_b64': encode(fold),
+                  })
+          matrix = json.dumps(include, separators=(',', ':'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as handle:
+              handle.write(f'matrix={matrix}\n')
+          print(f'Prepared {len(include)} HPO fold trials')
+          PY
+
+      - name: Download and checksum all pre-OOS monthly archives once
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          spec = importlib.util.spec_from_file_location('crypto_base', '/tmp/crypto_optstop/run_experiment.py')
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          frame, checksums = module.download_binance_months('2018-01', '2026-01', Path('shared_cache'))
+          print(f'Prepared {len(frame):,} hourly bars and verified {len(checksums)} monthly archives')
+          if frame['timestamp'].max() >= module.utc_ts('2026-02-01T00:00:00Z'):
+              raise RuntimeError('Preparation loaded a timestamp from the consumed OOS window')
+          PY
+
+      - name: Publish verified pre-OOS cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-optstop-preoos-cache
+          path: shared_cache
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  trials:
+    name: ${{ matrix.config_id }} / ${{ matrix.fold_id }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deterministic CPU environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 matplotlib==3.9.2 requests==2.32.3 tabulate==0.9.0
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: crypto-optstop-preoos-cache
+          path: shared_cache
+
+      - name: Decode base runner
+        run: |
+          mkdir -p /tmp/crypto_optstop
+          base64 --decode experiments/crypto_optstop/run_experiment.py.gz.b64 \
+            | gzip --decompress > /tmp/crypto_optstop/run_experiment.py
+          python -m py_compile /tmp/crypto_optstop/run_experiment.py experiments/crypto_optstop/run_hpo_trial.py
+
+      - name: Execute one isolated walk-forward trial
+        run: |
+          python experiments/crypto_optstop/run_hpo_trial.py \
+            --base-source /tmp/crypto_optstop/run_experiment.py \
+            --config-b64 "${{ matrix.config_b64 }}" \
+            --fold-b64 "${{ matrix.fold_b64 }}" \
+            --output-dir trial_output \
+            --cache-dir shared_cache
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hpo-trial-${{ matrix.config_id }}-${{ matrix.fold_id }}
+          path: trial_output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  aggregate_stage1:
+    name: Rank configurations across four folds
+    needs: trials
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      confirmation_matrix: ${{ steps.confirmation.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: python -m pip install numpy==2.1.3 pandas==2.2.3 matplotlib==3.9.2
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hpo-trial-*
+          path: all_trials
+          merge-multiple: false
+
+      - name: Compute robust walk-forward score
+        run: |
+          python experiments/crypto_optstop/aggregate_hpo.py stage1 \
+            --trials-dir all_trials \
+            --output-dir stage1_results
+
+      - name: Export top-three confirmation matrix
+        id: confirmation
+        run: echo "matrix=$(cat stage1_results/confirmation_matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crypto-optstop-hpo-stage1
+          path: stage1_results
+          if-no-files-found: error
+          retention-days: 7
+
+  confirmation:
+    name: Seed confirmation ${{ matrix.config_id }} / ${{ matrix.seed }}
+    needs: [prepare, aggregate_stage1]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJSON(needs.aggregate_stage1.outputs.confirmation_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deterministic CPU environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.1.3 pandas==2.2.3 matplotlib==3.9.2 requests==2.32.3 tabulate==0.9.0
+          python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: crypto-optstop-preoos-cache
+          path: shared_cache
+
+      - name: Decode base runner
+        run: |
+          mkdir -p /tmp/crypto_optstop
+          base64 --decode experiments/crypto_optstop/run_experiment.py.gz.b64 \
+            | gzip --decompress > /tmp/crypto_optstop/run_experiment.py
+
+      - name: Rerun latest pre-OOS fold with fixed seed
+        run: |
+          python experiments/crypto_optstop/run_hpo_trial.py \
+            --base-source /tmp/crypto_optstop/run_experiment.py \
+            --config-b64 "${{ matrix.config_b64 }}" \
+            --fold-b64 "${{ matrix.fold_b64 }}" \
+            --output-dir confirmation_output \
+            --cache-dir shared_cache
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hpo-confirm-${{ matrix.config_id }}-${{ matrix.seed }}
+          path: confirmation_output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+  final_report:
+    name: Final HPO selection and frozen pre-OOS bundle
+    needs: [trials, aggregate_stage1, confirmation]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: python -m pip install numpy==2.1.3 pandas==2.2.3 matplotlib==3.9.2
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hpo-trial-*
+          path: all_trials
+          merge-multiple: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hpo-confirm-*
+          path: confirmations
+          merge-multiple: false
+
+      - name: Apply seed-instability penalty and select configuration
+        run: |
+          python experiments/crypto_optstop/aggregate_hpo.py final \
+            --trials-dir all_trials \
+            --confirm-dir confirmations \
+            --output-dir hpo_results
+          find hpo_results -maxdepth 2 -type f -printf '%P %s bytes\n' | sort
+          cat hpo_results/selected_config.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crypto-optstop-hpo-results
+          path: hpo_results
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
