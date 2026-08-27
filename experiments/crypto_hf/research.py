@@ -6,10 +6,11 @@ import itertools
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from data import load_panel
-from strategy import StrategyConfig, calculate_metrics, run_backtest
+from strategy import StrategyConfig, calculate_metrics, prepare_signal_data, run_backtest
 
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
@@ -23,24 +24,28 @@ FOLDS = [
 ]
 HOLDOUT = ("2026-01-01T00:00:00Z", "2026-08-01T00:00:00Z")
 BASE_COST_BPS = 10.0
+DISPERSION_WINDOW_BARS = 30 * 24 * 12
 
 
 def build_grid() -> list[StrategyConfig]:
+    """Predeclared grid; the holdout is not involved in its construction."""
     configs: list[StrategyConfig] = []
-    for mode, lookback, hold, vol, top_k in itertools.product(
+    for mode, lookback, hold, vol, quantile in itertools.product(
         ["momentum", "reversal"],
         [3, 6, 12, 24, 48, 96],
         [6, 12],
         [0, 288],
-        [1, 2],
+        [0.0, 0.5, 0.7, 0.8],
     ):
         configs.append(StrategyConfig(
             mode=mode,
             lookback_bars=lookback,
             hold_bars=hold,
             volatility_window_bars=vol,
-            top_k=top_k,
+            top_k=2,
             roundtrip_cost_bps=BASE_COST_BPS,
+            dispersion_quantile=quantile,
+            dispersion_window_bars=DISPERSION_WINDOW_BARS,
         ))
     return configs
 
@@ -103,6 +108,8 @@ def summarize(fold_rows: pd.DataFrame) -> pd.DataFrame:
             "hold_bars": int(first["hold_bars"]),
             "volatility_window_bars": int(first["volatility_window_bars"]),
             "top_k": int(first["top_k"]),
+            "dispersion_quantile": float(first["dispersion_quantile"]),
+            "dispersion_window_bars": int(first["dispersion_window_bars"]),
             "roundtrip_cost_bps": float(first["roundtrip_cost_bps"]),
         })
     return pd.DataFrame(rows).sort_values("robust_score", ascending=False).reset_index(drop=True)
@@ -127,6 +134,49 @@ def monthly_table(cycles: pd.DataFrame, trades: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def signal_inputs(
+    closes: pd.DataFrame,
+    config: StrategyConfig,
+    score_cache: dict[tuple[int, int], pd.DataFrame],
+    dispersion_cache: dict[tuple[int, int], pd.Series],
+    threshold_cache: dict[tuple[int, int, float], pd.Series],
+) -> tuple[pd.DataFrame, pd.Series]:
+    score_key = (config.lookback_bars, config.volatility_window_bars)
+    if score_key not in score_cache:
+        ungated = StrategyConfig(
+            mode=config.mode,
+            lookback_bars=config.lookback_bars,
+            hold_bars=config.hold_bars,
+            volatility_window_bars=config.volatility_window_bars,
+            top_k=config.top_k,
+            roundtrip_cost_bps=config.roundtrip_cost_bps,
+            dispersion_quantile=0.0,
+            dispersion_window_bars=config.dispersion_window_bars,
+        )
+        scores, _ = prepare_signal_data(closes, ungated)
+        score_cache[score_key] = scores
+        dispersion_cache[score_key] = (
+            scores.max(axis=1, skipna=True) - scores.min(axis=1, skipna=True)
+        )
+    threshold_key = (*score_key, config.dispersion_quantile)
+    if threshold_key not in threshold_cache:
+        if config.dispersion_quantile <= 0.0:
+            threshold = pd.Series(-np.inf, index=closes.index, name="dispersion_threshold")
+        else:
+            threshold = (
+                dispersion_cache[score_key]
+                .rolling(
+                    config.dispersion_window_bars,
+                    min_periods=config.dispersion_window_bars,
+                )
+                .quantile(config.dispersion_quantile)
+                .shift(1)
+                .rename("dispersion_threshold")
+            )
+        threshold_cache[threshold_key] = threshold
+    return score_cache[score_key], threshold_cache[threshold_key]
+
+
 def main() -> None:
     output = Path("outputs/crypto_hf")
     cache = Path(".cache/crypto_hf")
@@ -149,9 +199,15 @@ def main() -> None:
 
     fold_rows: list[dict[str, object]] = []
     config_map: dict[str, StrategyConfig] = {}
+    score_cache: dict[tuple[int, int], pd.DataFrame] = {}
+    dispersion_cache: dict[tuple[int, int], pd.Series] = {}
+    threshold_cache: dict[tuple[int, int, float], pd.Series] = {}
     configs = build_grid()
     for number, config in enumerate(configs, start=1):
         config_map[config.config_id] = config
+        scores, threshold = signal_inputs(
+            closes, config, score_cache, dispersion_cache, threshold_cache
+        )
         cycles, trades, _ = run_backtest(
             opens,
             closes,
@@ -159,6 +215,8 @@ def main() -> None:
             FOLDS[0][1],
             FOLDS[-1][2],
             include_trade_details=False,
+            prepared_scores=scores,
+            prepared_threshold=threshold,
         )
         for fold_id, start, end in FOLDS:
             _, _, metrics = slice_result(cycles, trades, config, start, end)
@@ -170,7 +228,7 @@ def main() -> None:
                 **metrics,
                 "fold_utility": utility(metrics),
             })
-        if number % 8 == 0:
+        if number % 16 == 0:
             print(f"Completed {number}/{len(configs)} configurations", flush=True)
 
     fold_frame = pd.DataFrame(fold_rows)
@@ -182,9 +240,18 @@ def main() -> None:
         raise RuntimeError("No configuration met the four-fold trade-frequency constraint")
     selected_row = eligible.iloc[0]
     selected = config_map[str(selected_row["config_id"])]
+    selected_scores, selected_threshold = signal_inputs(
+        closes, selected, score_cache, dispersion_cache, threshold_cache
+    )
 
     holdout_cycles, holdout_trades, holdout_metrics = run_backtest(
-        opens, closes, selected, HOLDOUT[0], HOLDOUT[1]
+        opens,
+        closes,
+        selected,
+        HOLDOUT[0],
+        HOLDOUT[1],
+        prepared_scores=selected_scores,
+        prepared_threshold=selected_threshold,
     )
     monthly = monthly_table(holdout_cycles, holdout_trades)
 
@@ -197,6 +264,8 @@ def main() -> None:
             volatility_window_bars=selected.volatility_window_bars,
             top_k=selected.top_k,
             roundtrip_cost_bps=cost,
+            dispersion_quantile=selected.dispersion_quantile,
+            dispersion_window_bars=selected.dispersion_window_bars,
         )
         _, _, metrics = run_backtest(
             opens,
@@ -205,6 +274,8 @@ def main() -> None:
             HOLDOUT[0],
             HOLDOUT[1],
             include_trade_details=False,
+            prepared_scores=selected_scores,
+            prepared_threshold=selected_threshold,
         )
         sensitivity_rows.append({"roundtrip_cost_bps": cost, **metrics})
 
