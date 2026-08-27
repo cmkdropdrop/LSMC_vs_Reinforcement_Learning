@@ -17,11 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Decode and inspect relevant strategy sections
+      - name: Decode and inspect detailed evaluator
         run: |
-          base64 -d experiments/crypto_hf_carry/run_carry.py.gz.b64 | gzip -d > /tmp/run_carry.py
-          python -m py_compile /tmp/run_carry.py
-          echo '=== FEATURE / PLAN LOGIC ==='
-          sed -n '330,440p' /tmp/run_carry.py
-          echo '=== GRID / SELECTION / EVALUATION ==='
-          sed -n '440,525p' /tmp/run_carry.py
+          base64 -d experiments/crypto_hf_carry/evaluate_detailed.py.gz.b64 | gzip -d > /tmp/evaluate_detailed.py
+          python -m py_compile /tmp/evaluate_detailed.py
+          echo '=== DETAILED EVALUATOR TOP ==='
+          sed -n '1,180p' /tmp/evaluate_detailed.py
+          echo '=== DETAILED EVALUATOR REMAINDER ==='
+          sed -n '180,420p' /tmp/evaluate_detailed.py
