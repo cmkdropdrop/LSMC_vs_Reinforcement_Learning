@@ -21,9 +21,7 @@ jobs:
         run: |
           base64 -d experiments/crypto_hf_carry/run_carry.py.gz.b64 | gzip -d > /tmp/run_carry.py
           python -m py_compile /tmp/run_carry.py
-          echo '=== CONSTANTS / UNIVERSE ==='
-          sed -n '1,140p' /tmp/run_carry.py
-          echo '=== GRID / FREQUENCY / SELECTION ==='
-          grep -n -E 'def grid|product\(|top_k|minimum_monthly|eligible|frequency|pair round|round_trip_trades|month' /tmp/run_carry.py
-          echo '=== DEVELOPMENT FUNCTION ==='
-          sed -n '430,510p' /tmp/run_carry.py
+          echo '=== FEATURE / PLAN LOGIC ==='
+          sed -n '330,440p' /tmp/run_carry.py
+          echo '=== GRID / SELECTION / EVALUATION ==='
+          sed -n '440,525p' /tmp/run_carry.py
