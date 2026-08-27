@@ -6,7 +6,6 @@ import itertools
 import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from data import load_panel
@@ -154,7 +153,12 @@ def main() -> None:
     for number, config in enumerate(configs, start=1):
         config_map[config.config_id] = config
         cycles, trades, _ = run_backtest(
-            opens, closes, config, FOLDS[0][1], FOLDS[-1][2]
+            opens,
+            closes,
+            config,
+            FOLDS[0][1],
+            FOLDS[-1][2],
+            include_trade_details=False,
         )
         for fold_id, start, end in FOLDS:
             _, _, metrics = slice_result(cycles, trades, config, start, end)
@@ -194,7 +198,14 @@ def main() -> None:
             top_k=selected.top_k,
             roundtrip_cost_bps=cost,
         )
-        _, _, metrics = run_backtest(opens, closes, cost_config, HOLDOUT[0], HOLDOUT[1])
+        _, _, metrics = run_backtest(
+            opens,
+            closes,
+            cost_config,
+            HOLDOUT[0],
+            HOLDOUT[1],
+            include_trade_details=False,
+        )
         sensitivity_rows.append({"roundtrip_cost_bps": cost, **metrics})
 
     fold_frame.to_csv(output / "development_fold_results.csv", index=False)
