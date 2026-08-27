@@ -50,7 +50,7 @@ def download_month(symbol: str, interval: str, month: str, cache: Path) -> Path:
 
 
 def read_month(path: Path, symbol: str) -> pd.DataFrame:
-    """Read only timestamp, open, and close from one kline archive."""
+    """Read timestamp, open, and close while tolerating an optional header."""
     raw = path.read_bytes()
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         members = [name for name in archive.namelist() if name.endswith(".csv")]
@@ -61,15 +61,24 @@ def read_month(path: Path, symbol: str) -> pd.DataFrame:
             header=None,
             names=KLINE_COLUMNS,
             usecols=["open_time", "open", "close"],
+            dtype=str,
         )
+
+    open_time = pd.to_numeric(frame["open_time"], errors="coerce")
+    open_price = pd.to_numeric(frame["open"], errors="coerce")
+    close_price = pd.to_numeric(frame["close"], errors="coerce")
+    valid = open_time.notna() & open_price.notna() & close_price.notna()
+    if not bool(valid.any()):
+        raise RuntimeError(f"No numeric kline rows found in {path}")
+    frame = frame.loc[valid].copy()
     frame["symbol"] = symbol
-    frame["open_time"] = pd.to_numeric(frame["open_time"], errors="raise").astype("int64")
+    frame["open_time"] = open_time.loc[valid].astype("int64")
     # Binance archives can encode timestamps in milliseconds or microseconds.
     if int(frame["open_time"].median()) > 10_000_000_000_000:
         frame["open_time"] = frame["open_time"] // 1000
-    frame["open"] = pd.to_numeric(frame["open"], errors="raise").astype(float)
-    frame["close"] = pd.to_numeric(frame["close"], errors="raise").astype(float)
-    return frame
+    frame["open"] = open_price.loc[valid].astype(float)
+    frame["close"] = close_price.loc[valid].astype(float)
+    return frame[["open_time", "open", "close", "symbol"]]
 
 
 def load_panel(
