@@ -64,6 +64,9 @@ def read_month(path: Path, symbol: str) -> pd.DataFrame:
         )
     frame["symbol"] = symbol
     frame["open_time"] = pd.to_numeric(frame["open_time"], errors="raise").astype("int64")
+    # Binance archives can encode timestamps in milliseconds or microseconds.
+    if int(frame["open_time"].median()) > 10_000_000_000_000:
+        frame["open_time"] = frame["open_time"] // 1000
     frame["open"] = pd.to_numeric(frame["open"], errors="raise").astype(float)
     frame["close"] = pd.to_numeric(frame["close"], errors="raise").astype(float)
     return frame
